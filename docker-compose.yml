@@ -1,0 +1,218 @@
+services:
+  node1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tierstore:local
+    container_name: tierstore-node1
+    hostname: node1
+    restart: unless-stopped
+    command:
+      - node
+      - -id
+      - node1
+      - -listen
+      - :9101
+      - -hot-dir
+      - /var/lib/tierstore/hot
+      - -warm-dir
+      - /var/lib/tierstore/warm
+    ports:
+      - "9101:9101"
+    volumes:
+      - node1-hot:/var/lib/tierstore/hot
+      - node1-warm:/var/lib/tierstore/warm
+    networks:
+      - tierstore
+
+  node2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tierstore:local
+    container_name: tierstore-node2
+    hostname: node2
+    restart: unless-stopped
+    command:
+      - node
+      - -id
+      - node2
+      - -listen
+      - :9102
+      - -hot-dir
+      - /var/lib/tierstore/hot
+      - -warm-dir
+      - /var/lib/tierstore/warm
+    ports:
+      - "9102:9102"
+    volumes:
+      - node2-hot:/var/lib/tierstore/hot
+      - node2-warm:/var/lib/tierstore/warm
+    networks:
+      - tierstore
+
+  node3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tierstore:local
+    container_name: tierstore-node3
+    hostname: node3
+    restart: unless-stopped
+    command:
+      - node
+      - -id
+      - node3
+      - -listen
+      - :9103
+      - -hot-dir
+      - /var/lib/tierstore/hot
+      - -warm-dir
+      - /var/lib/tierstore/warm
+    ports:
+      - "9103:9103"
+    volumes:
+      - node3-hot:/var/lib/tierstore/hot
+      - node3-warm:/var/lib/tierstore/warm
+    networks:
+      - tierstore
+
+  gw1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tierstore:local
+    container_name: tierstore-gw1
+    hostname: gw1
+    restart: unless-stopped
+    depends_on:
+      - node1
+      - node2
+      - node3
+    command:
+      - gateway
+      - -gateway-id
+      - gw1
+      - -listen
+      - :9000
+      - -advertise-url
+      - http://gw1:9000
+      - -raft-addr
+      - gw1:10001
+      - -raft-dir
+      - /var/lib/tierstore/raft
+      - -bootstrap
+      - -join
+      - gw2=http://gw2:9000@gw2:10002,gw3=http://gw3:9000@gw3:10003
+      - -replicas
+      - "2"
+      - -cold-after
+      - 720h
+    ports:
+      - "9000:9000"
+    volumes:
+      - gw1-raft:/var/lib/tierstore/raft
+    networks:
+      - tierstore
+
+  gw2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tierstore:local
+    container_name: tierstore-gw2
+    hostname: gw2
+    restart: unless-stopped
+    depends_on:
+      - gw1
+    command:
+      - gateway
+      - -gateway-id
+      - gw2
+      - -listen
+      - :9000
+      - -advertise-url
+      - http://gw2:9000
+      - -raft-addr
+      - gw2:10002
+      - -raft-dir
+      - /var/lib/tierstore/raft
+      - -join
+      - gw1=http://gw1:9000@gw1:10001,gw3=http://gw3:9000@gw3:10003
+      - -replicas
+      - "2"
+      - -cold-after
+      - 720h
+    ports:
+      - "9001:9000"
+    volumes:
+      - gw2-raft:/var/lib/tierstore/raft
+    networks:
+      - tierstore
+
+  gw3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tierstore:local
+    container_name: tierstore-gw3
+    hostname: gw3
+    restart: unless-stopped
+    depends_on:
+      - gw1
+    command:
+      - gateway
+      - -gateway-id
+      - gw3
+      - -listen
+      - :9000
+      - -advertise-url
+      - http://gw3:9000
+      - -raft-addr
+      - gw3:10003
+      - -raft-dir
+      - /var/lib/tierstore/raft
+      - -join
+      - gw1=http://gw1:9000@gw1:10001,gw2=http://gw2:9000@gw2:10002
+      - -replicas
+      - "2"
+      - -cold-after
+      - 720h
+    ports:
+      - "9002:9000"
+    volumes:
+      - gw3-raft:/var/lib/tierstore/raft
+    networks:
+      - tierstore
+
+  cluster-init:
+    image: alpine:3.20
+    container_name: tierstore-cluster-init
+    depends_on:
+      - gw1
+      - gw2
+      - gw3
+      - node1
+      - node2
+      - node3
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - "apk add --no-cache curl >/dev/null; until curl -fsS http://gw1:9000/_admin/cluster >/dev/null; do sleep 1; done; until curl -fsS http://node1:9101/_internal/health >/dev/null; do sleep 1; done; until curl -fsS http://node2:9102/_internal/health >/dev/null; do sleep 1; done; until curl -fsS http://node3:9103/_internal/health >/dev/null; do sleep 1; done; curl -fsS -X POST http://gw1:9000/_admin/nodes -H 'content-type: application/json' -d '{\"id\":\"node1\",\"url\":\"http://node1:9101\",\"weight_hot\":1,\"weight_warm\":1}'; curl -fsS -X POST http://gw1:9000/_admin/nodes -H 'content-type: application/json' -d '{\"id\":\"node2\",\"url\":\"http://node2:9102\",\"weight_hot\":1,\"weight_warm\":1}'; curl -fsS -X POST http://gw1:9000/_admin/nodes -H 'content-type: application/json' -d '{\"id\":\"node3\",\"url\":\"http://node3:9103\",\"weight_hot\":1,\"weight_warm\":1}'; echo 'tierstore cluster initialized'"
+    restart: "no"
+    networks:
+      - tierstore
+
+networks:
+  tierstore:
+
+volumes:
+  node1-hot:
+  node1-warm:
+  node2-hot:
+  node2-warm:
+  node3-hot:
+  node3-warm:
+  gw1-raft:
+  gw2-raft:
+  gw3-raft:

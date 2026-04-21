@@ -1,250 +1,519 @@
 package meta
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 
 	"tierstore/internal/model"
 )
 
-var ErrNotFound = errors.New("not found")
+var (
+	ErrNotFound  = errors.New("not found")
+	ErrConflict  = errors.New("conflict")
+	ErrNotLeader = errors.New("not leader")
+)
+
+type Peer struct {
+	ID       string `json:"id"`
+	APIURL   string `json:"api_url"`
+	RaftAddr string `json:"raft_addr"`
+}
+
+type Config struct {
+	GatewayID         string
+	AdvertiseURL      string
+	RaftAddr          string
+	RaftDir           string
+	Bootstrap         bool
+	Peers             []Peer
+	PlacementGroups   uint64
+	ReplicationFactor int
+	ApplyTimeout      time.Duration
+	ReadTimeout       time.Duration
+	HTTPClient        *http.Client
+}
 
 type Store struct {
-	mu   sync.RWMutex
-	path string
-	st   model.State
+	cfg        Config
+	fsm        *fsm
+	raft       *raft.Raft
+	logStore   *raftboltdb.BoltStore
+	transport  *raft.NetworkTransport
+	httpClient *http.Client
+
+	mu       sync.RWMutex
+	peerByID map[string]Peer
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
-func NewStore(path string, placementGroups uint64, replicationFactor int) (*Store, error) {
-	s := &Store{
-		path: path,
-		st: model.State{
-			Buckets: make(map[string]*model.Bucket),
-			Objects: make(map[string]*model.Object),
-			Cluster: model.Cluster{
-				Epoch:             1,
-				PlacementGroups:   placementGroups,
-				ReplicationFactor: replicationFactor,
-				Nodes:             make(map[string]*model.Node),
-			},
-		},
+func NewStore(cfg Config) (*Store, error) {
+	if cfg.GatewayID == "" {
+		return nil, fmt.Errorf("gateway id is required")
 	}
-	if err := s.load(); err != nil {
-		return nil, err
+	if cfg.AdvertiseURL == "" {
+		return nil, fmt.Errorf("advertise url is required")
 	}
-	return s, nil
-}
+	if cfg.RaftAddr == "" {
+		return nil, fmt.Errorf("raft addr is required")
+	}
+	if cfg.RaftDir == "" {
+		return nil, fmt.Errorf("raft dir is required")
+	}
+	if cfg.PlacementGroups == 0 {
+		cfg.PlacementGroups = 1024
+	}
+	if cfg.ReplicationFactor == 0 {
+		cfg.ReplicationFactor = 3
+	}
+	if cfg.ApplyTimeout == 0 {
+		cfg.ApplyTimeout = 10 * time.Second
+	}
+	if cfg.ReadTimeout == 0 {
+		cfg.ReadTimeout = 5 * time.Second
+	}
+	if cfg.HTTPClient == nil {
+		cfg.HTTPClient = &http.Client{Timeout: cfg.ReadTimeout}
+	}
+	if _, err := url.Parse(cfg.AdvertiseURL); err != nil {
+		return nil, fmt.Errorf("parse advertise url: %w", err)
+	}
 
-func (s *Store) load() error {
-	if s.path == "" {
-		return nil
+	cfg.Peers = normalizePeers(cfg)
+	if err := os.MkdirAll(cfg.RaftDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir raft dir: %w", err)
 	}
-	data, err := os.ReadFile(s.path)
+
+	fsm := newFSM(cfg.PlacementGroups, cfg.ReplicationFactor)
+	logStore, err := raftboltdb.NewBoltStore(filepath.Join(cfg.RaftDir, "raft.db"))
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
+		return nil, fmt.Errorf("open raft bolt store: %w", err)
+	}
+	snapshots, err := raft.NewFileSnapshotStore(filepath.Join(cfg.RaftDir, "snapshots"), 2, os.Stderr)
+	if err != nil {
+		return nil, fmt.Errorf("open raft snapshot store: %w", err)
+	}
+	hasState, err := raft.HasExistingState(logStore, logStore, snapshots)
+	if err != nil {
+		return nil, fmt.Errorf("check raft state: %w", err)
+	}
+
+	raftConfig := raft.DefaultConfig()
+	raftConfig.LocalID = raft.ServerID(cfg.GatewayID)
+	raftConfig.SnapshotInterval = 30 * time.Second
+	raftConfig.SnapshotThreshold = 64
+
+	transport, err := raft.NewTCPTransport(cfg.RaftAddr, nil, 3, 10*time.Second, os.Stderr)
+	if err != nil {
+		return nil, fmt.Errorf("create raft transport: %w", err)
+	}
+	if cfg.Bootstrap && !hasState {
+		initial := raft.Configuration{
+			Servers: []raft.Server{{
+				ID:       raft.ServerID(cfg.GatewayID),
+				Address:  transport.LocalAddr(),
+				Suffrage: raft.Voter,
+			}},
 		}
-		return fmt.Errorf("read state: %w", err)
+		if err := raft.BootstrapCluster(raftConfig, logStore, logStore, snapshots, transport, initial); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
+			return nil, fmt.Errorf("bootstrap raft cluster: %w", err)
+		}
 	}
-	var st model.State
-	if err := json.Unmarshal(data, &st); err != nil {
-		return fmt.Errorf("decode state: %w", err)
+
+	r, err := raft.NewRaft(raftConfig, fsm, logStore, logStore, snapshots, transport)
+	if err != nil {
+		return nil, fmt.Errorf("create raft node: %w", err)
 	}
-	if st.Buckets == nil {
-		st.Buckets = make(map[string]*model.Bucket)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	store := &Store{
+		cfg:        cfg,
+		fsm:        fsm,
+		raft:       r,
+		logStore:   logStore,
+		transport:  transport,
+		httpClient: cfg.HTTPClient,
+		peerByID:   make(map[string]Peer, len(cfg.Peers)),
+		ctx:        ctx,
+		cancel:     cancel,
 	}
-	if st.Objects == nil {
-		st.Objects = make(map[string]*model.Object)
+	for _, peer := range cfg.Peers {
+		store.peerByID[peer.ID] = peer
 	}
-	if st.Cluster.Nodes == nil {
-		st.Cluster.Nodes = make(map[string]*model.Node)
+	if cfg.Bootstrap {
+		go store.runBootstrapMembership()
 	}
-	if st.Cluster.PlacementGroups == 0 {
-		st.Cluster.PlacementGroups = 1024
-	}
-	if st.Cluster.ReplicationFactor == 0 {
-		st.Cluster.ReplicationFactor = 3
-	}
-	if st.Cluster.Epoch == 0 {
-		st.Cluster.Epoch = 1
-	}
-	s.st = st
-	return nil
+	return store, nil
 }
 
-func (s *Store) saveLocked() error {
-	if s.path == "" {
-		return nil
+func (s *Store) Close() error {
+	s.cancel()
+	var shutdownErr error
+	if s.transport != nil {
+		if err := s.transport.Close(); err != nil && shutdownErr == nil {
+			shutdownErr = err
+		}
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return fmt.Errorf("mkdir state dir: %w", err)
+	if s.raft != nil {
+		if err := s.raft.Shutdown().Error(); err != nil && shutdownErr == nil {
+			shutdownErr = err
+		}
 	}
-	data, err := json.MarshalIndent(s.st, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal state: %w", err)
+	if s.logStore != nil {
+		if err := s.logStore.Close(); err != nil && shutdownErr == nil {
+			shutdownErr = err
+		}
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return fmt.Errorf("write temp state: %w", err)
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		return fmt.Errorf("rename state: %w", err)
-	}
-	return nil
+	return shutdownErr
+}
+
+func (s *Store) LeaderCh() <-chan bool {
+	return s.raft.LeaderCh()
+}
+
+func (s *Store) IsLeader() bool {
+	return s.raft.State() == raft.Leader
 }
 
 func (s *Store) Snapshot() model.State {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return model.CloneState(s.st)
-}
-
-func (s *Store) EnsureBucket(name string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.st.Buckets[name]; ok {
-		return nil
-	}
-	s.st.Buckets[name] = &model.Bucket{Name: name, CreatedAt: time.Now().UTC()}
-	return s.saveLocked()
+	return s.fsm.snapshot()
 }
 
 func (s *Store) BucketExists(name string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	_, ok := s.st.Buckets[name]
-	return ok
-}
-
-func (s *Store) PutObject(obj *model.Object) error {
-	if obj == nil {
-		return errors.New("nil object")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.st.Buckets[obj.Bucket]; !ok {
-		s.st.Buckets[obj.Bucket] = &model.Bucket{Name: obj.Bucket, CreatedAt: time.Now().UTC()}
-	}
-	s.st.Objects[model.ObjectMapKey(obj.Bucket, obj.Key)] = model.CloneObject(obj)
-	return s.saveLocked()
+	return s.fsm.bucketExists(name)
 }
 
 func (s *Store) GetObject(bucket, key string) (*model.Object, error) {
+	return s.fsm.getObject(bucket, key)
+}
+
+func (s *Store) Barrier(ctx context.Context) error {
+	if s.IsLeader() {
+		return s.barrierOnLeader(ctx)
+	}
+	idx, err := s.fetchLeaderReadIndex(ctx)
+	if err != nil {
+		return err
+	}
+	return s.waitForAppliedIndex(ctx, idx)
+}
+
+func (s *Store) EnsureBucket(ctx context.Context, name string) error {
+	return s.apply(ctx, command{
+		Type:   commandEnsureBucket,
+		Bucket: name,
+		At:     time.Now().UTC(),
+	}, nil)
+}
+
+func (s *Store) PutObject(ctx context.Context, obj *model.Object) (*model.Object, error) {
+	result := &commandResult{}
+	if err := s.apply(ctx, command{Type: commandPutObject, Object: model.CloneObject(obj)}, result); err != nil {
+		return nil, err
+	}
+	return result.Object, nil
+}
+
+func (s *Store) DeleteObject(ctx context.Context, bucket, key string) (*model.Object, error) {
+	result := &commandResult{}
+	if err := s.apply(ctx, command{Type: commandDeleteObject, Bucket: bucket, Key: key}, result); err != nil {
+		return nil, err
+	}
+	return result.Object, nil
+}
+
+func (s *Store) MarkAccessBatch(ctx context.Context, events []model.AccessEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	if s.IsLeader() {
+		return s.apply(ctx, command{Type: commandMarkAccesses, Events: cloneAccessEvents(events)}, nil)
+	}
+	return s.forwardAccessBatch(ctx, events)
+}
+
+func (s *Store) UpsertNode(ctx context.Context, node *model.Node) (*model.Node, error) {
+	result := &commandResult{}
+	if err := s.apply(ctx, command{
+		Type: commandUpsertNode,
+		Node: model.CloneNode(node),
+		At:   time.Now().UTC(),
+	}, result); err != nil {
+		return nil, err
+	}
+	return result.Node, nil
+}
+
+func (s *Store) SetNodeState(ctx context.Context, id string, state model.NodeState) error {
+	return s.apply(ctx, command{
+		Type:      commandSetNodeState,
+		NodeID:    id,
+		NodeState: state,
+		At:        time.Now().UTC(),
+	}, nil)
+}
+
+func (s *Store) RemoveNode(ctx context.Context, id string) error {
+	return s.apply(ctx, command{
+		Type:   commandRemoveNode,
+		NodeID: id,
+		At:     time.Now().UTC(),
+	}, nil)
+}
+
+func (s *Store) PatchObject(ctx context.Context, patch *ObjectPatch) (*model.Object, error) {
+	result := &commandResult{}
+	if err := s.apply(ctx, command{Type: commandPatchObject, ObjectPatch: patch}, result); err != nil {
+		return nil, err
+	}
+	return result.Object, nil
+}
+
+func (s *Store) ReadIndex(ctx context.Context) (uint64, error) {
+	if !s.IsLeader() {
+		return 0, ErrNotLeader
+	}
+	if err := s.barrierOnLeader(ctx); err != nil {
+		return 0, err
+	}
+	return s.raft.AppliedIndex(), nil
+}
+
+func (s *Store) LeaderPeer() (Peer, error) {
+	leaderAddr, leaderID := s.raft.LeaderWithID()
+	if leaderID == "" {
+		return Peer{}, ErrNotLeader
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	obj, ok := s.st.Objects[model.ObjectMapKey(bucket, key)]
-	if !ok {
-		return nil, ErrNotFound
+	if peer, ok := s.peerByID[string(leaderID)]; ok {
+		return peer, nil
 	}
-	return model.CloneObject(obj), nil
+	return Peer{ID: string(leaderID), RaftAddr: string(leaderAddr)}, nil
 }
 
-func (s *Store) UpdateObject(bucket, key string, fn func(*model.Object) error) (*model.Object, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	obj, ok := s.st.Objects[model.ObjectMapKey(bucket, key)]
-	if !ok {
-		return nil, ErrNotFound
+func (s *Store) apply(ctx context.Context, cmd command, out *commandResult) error {
+	if !s.IsLeader() {
+		return ErrNotLeader
 	}
-	cp := model.CloneObject(obj)
-	if err := fn(cp); err != nil {
-		return nil, err
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("marshal command: %w", err)
 	}
-	s.st.Objects[model.ObjectMapKey(bucket, key)] = cp
-	if err := s.saveLocked(); err != nil {
-		return nil, err
+	future := s.raft.Apply(data, timeoutFromContext(ctx, s.cfg.ApplyTimeout))
+	if err := future.Error(); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			return ErrNotLeader
+		}
+		return err
 	}
-	return model.CloneObject(cp), nil
-}
-
-func (s *Store) DeleteObject(bucket, key string) (*model.Object, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	mapKey := model.ObjectMapKey(bucket, key)
-	obj, ok := s.st.Objects[mapKey]
-	if !ok {
-		return nil, ErrNotFound
+	resp, _ := future.Response().(*commandResult)
+	if resp == nil {
+		return nil
 	}
-	delete(s.st.Objects, mapKey)
-	if err := s.saveLocked(); err != nil {
-		return nil, err
+	if err := commandError(resp.Err); err != nil {
+		return err
 	}
-	return model.CloneObject(obj), nil
-}
-
-func (s *Store) MarkAccess(bucket, key string, at time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	obj, ok := s.st.Objects[model.ObjectMapKey(bucket, key)]
-	if !ok {
-		return ErrNotFound
-	}
-	if at.After(obj.LastAccessedAt) {
-		obj.LastAccessedAt = at.UTC()
-		obj.UpdatedAt = time.Now().UTC()
-		return s.saveLocked()
+	if out != nil {
+		*out = *resp
 	}
 	return nil
 }
 
-func (s *Store) UpsertNode(node *model.Node) error {
-	if node == nil {
-		return errors.New("nil node")
-	}
-	now := time.Now().UTC()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cp := model.CloneNode(node)
-	if existing, ok := s.st.Cluster.Nodes[node.ID]; ok {
-		cp.CreatedAt = existing.CreatedAt
-		if cp.CreatedAt.IsZero() {
-			cp.CreatedAt = now
+func (s *Store) barrierOnLeader(ctx context.Context) error {
+	future := s.raft.Barrier(timeoutFromContext(ctx, s.cfg.ReadTimeout))
+	if err := future.Error(); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			return ErrNotLeader
 		}
-	} else {
-		cp.CreatedAt = now
+		return err
 	}
-	cp.UpdatedAt = now
-	if cp.State == "" {
-		cp.State = model.NodeStateActive
-	}
-	if cp.WeightHot <= 0 {
-		cp.WeightHot = 1
-	}
-	if cp.WeightWarm <= 0 {
-		cp.WeightWarm = 1
-	}
-	s.st.Cluster.Nodes[node.ID] = cp
-	s.st.Cluster.Epoch++
-	return s.saveLocked()
+	return nil
 }
 
-func (s *Store) SetNodeState(id string, state model.NodeState) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	node, ok := s.st.Cluster.Nodes[id]
-	if !ok {
-		return ErrNotFound
+func (s *Store) fetchLeaderReadIndex(ctx context.Context) (uint64, error) {
+	peer, err := s.LeaderPeer()
+	if err != nil {
+		return 0, err
 	}
-	node.State = state
-	node.UpdatedAt = time.Now().UTC()
-	s.st.Cluster.Epoch++
-	return s.saveLocked()
+	if peer.APIURL == "" {
+		return 0, fmt.Errorf("leader api url is unknown")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(peer.APIURL, "/")+"/_internal/control/read-index", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		return 0, ErrNotLeader
+	}
+	if resp.StatusCode/100 != 2 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		return 0, fmt.Errorf("leader read-index failed: status=%d body=%q", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var payload struct {
+		AppliedIndex uint64 `json:"applied_index"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return 0, err
+	}
+	return payload.AppliedIndex, nil
 }
 
-func (s *Store) RemoveNode(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	node, ok := s.st.Cluster.Nodes[id]
-	if !ok {
-		return ErrNotFound
+func (s *Store) waitForAppliedIndex(ctx context.Context, want uint64) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if s.raft.AppliedIndex() >= want {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
-	node.State = model.NodeStateRemoved
-	node.UpdatedAt = time.Now().UTC()
-	s.st.Cluster.Epoch++
-	return s.saveLocked()
+}
+
+func (s *Store) forwardAccessBatch(ctx context.Context, events []model.AccessEvent) error {
+	peer, err := s.LeaderPeer()
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(struct {
+		Events []model.AccessEvent `json:"events"`
+	}{
+		Events: cloneAccessEvents(events),
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(peer.APIURL, "/")+"/_internal/control/access-batch", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		return ErrNotLeader
+	}
+	if resp.StatusCode/100 != 2 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		return fmt.Errorf("forward access batch failed: status=%d body=%q", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	return nil
+}
+
+func (s *Store) runBootstrapMembership() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			if !s.IsLeader() {
+				continue
+			}
+			if err := s.ensureConfiguredPeers(); err != nil {
+				log.Printf("raft membership reconcile: %v", err)
+			}
+		}
+	}
+}
+
+func (s *Store) ensureConfiguredPeers() error {
+	future := s.raft.GetConfiguration()
+	if err := future.Error(); err != nil {
+		return err
+	}
+	current := make(map[raft.ServerID]raft.Server, len(future.Configuration().Servers))
+	for _, server := range future.Configuration().Servers {
+		current[server.ID] = server
+	}
+	s.mu.RLock()
+	peers := make([]Peer, 0, len(s.peerByID))
+	for _, peer := range s.peerByID {
+		peers = append(peers, peer)
+	}
+	s.mu.RUnlock()
+	for _, peer := range peers {
+		if peer.ID == s.cfg.GatewayID {
+			continue
+		}
+		serverID := raft.ServerID(peer.ID)
+		if existing, ok := current[serverID]; ok && string(existing.Address) == peer.RaftAddr {
+			continue
+		}
+		future := s.raft.AddVoter(serverID, raft.ServerAddress(peer.RaftAddr), 0, s.cfg.ApplyTimeout)
+		if err := future.Error(); err != nil && !strings.Contains(err.Error(), "exists") {
+			return err
+		}
+	}
+	return nil
+}
+
+func normalizePeers(cfg Config) []Peer {
+	seen := make(map[string]Peer)
+	for _, peer := range cfg.Peers {
+		if peer.ID == "" {
+			continue
+		}
+		peer.APIURL = strings.TrimRight(peer.APIURL, "/")
+		seen[peer.ID] = peer
+	}
+	seen[cfg.GatewayID] = Peer{
+		ID:       cfg.GatewayID,
+		APIURL:   strings.TrimRight(cfg.AdvertiseURL, "/"),
+		RaftAddr: cfg.RaftAddr,
+	}
+	out := make([]Peer, 0, len(seen))
+	for _, peer := range seen {
+		out = append(out, peer)
+	}
+	return out
+}
+
+func cloneAccessEvents(events []model.AccessEvent) []model.AccessEvent {
+	if len(events) == 0 {
+		return nil
+	}
+	out := make([]model.AccessEvent, len(events))
+	copy(out, events)
+	return out
+}
+
+func timeoutFromContext(ctx context.Context, fallback time.Duration) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout := time.Until(deadline)
+		if timeout <= 0 {
+			return time.Millisecond
+		}
+		return timeout
+	}
+	return fallback
 }

@@ -50,10 +50,39 @@ Start three nodes:
 ./tierstore node -id node3 -listen :9103 -hot-dir ./node3-nvme -warm-dir ./node3-hdd
 ```
 
-Start the gateway:
+Start three gateway/controller nodes:
 
 ```bash
-./tierstore gateway -listen :9000 -state ./tierstore-state.json -replicas 2 -cold-after 720h
+./tierstore gateway \
+  -gateway-id gw1 \
+  -listen :9000 \
+  -advertise-url http://127.0.0.1:9000 \
+  -raft-addr 127.0.0.1:10001 \
+  -raft-dir ./gw1-raft \
+  -bootstrap \
+  -join 'gw2=http://127.0.0.1:9001@127.0.0.1:10002,gw3=http://127.0.0.1:9002@127.0.0.1:10003' \
+  -replicas 2 \
+  -cold-after 720h
+
+./tierstore gateway \
+  -gateway-id gw2 \
+  -listen :9001 \
+  -advertise-url http://127.0.0.1:9001 \
+  -raft-addr 127.0.0.1:10002 \
+  -raft-dir ./gw2-raft \
+  -join 'gw1=http://127.0.0.1:9000@127.0.0.1:10001,gw3=http://127.0.0.1:9002@127.0.0.1:10003' \
+  -replicas 2 \
+  -cold-after 720h
+
+./tierstore gateway \
+  -gateway-id gw3 \
+  -listen :9002 \
+  -advertise-url http://127.0.0.1:9002 \
+  -raft-addr 127.0.0.1:10003 \
+  -raft-dir ./gw3-raft \
+  -join 'gw1=http://127.0.0.1:9000@127.0.0.1:10001,gw2=http://127.0.0.1:9001@127.0.0.1:10002' \
+  -replicas 2 \
+  -cold-after 720h
 ```
 
 Add the nodes:
@@ -97,15 +126,41 @@ Drain a node:
 curl -X POST http://127.0.0.1:9000/_admin/nodes/node2/drain
 ```
 
-The rebalance worker will move replicas to the new desired placement over time.
+The rebalance worker runs only on the current Raft leader and will move replicas to the new desired placement over time.
+
+## Run with Docker Compose
+
+Build and start the full 3-node, 3-gateway cluster:
+
+```bash
+docker compose up --build -d
+```
+
+The compose stack also starts a one-shot `cluster-init` container that waits for the Raft cluster to elect a leader and then registers all three storage nodes automatically.
+
+Use any gateway on the host:
+
+```bash
+curl -X PUT http://127.0.0.1:9000/photos
+curl -T ./pic.jpg http://127.0.0.1:9001/photos/demo/pic.jpg
+curl http://127.0.0.1:9002/photos/demo/pic.jpg -o out.jpg
+curl http://127.0.0.1:9000/_admin/cluster | jq
+```
+
+Stop and remove the cluster state:
+
+```bash
+docker compose down -v
+```
 
 ## Design notes
 
 - Objects are first written to the **hot** tier.
-- `last_accessed_at` is updated asynchronously by the gateway.
+- `last_accessed_at` is updated asynchronously by the gateway cluster.
 - The tiering worker demotes hot objects to the **warm** tier after `cold-after` worth of inactivity.
 - If `-promote-on-read=true`, reads of warm objects trigger best-effort promotion back to hot storage.
 - Placement is computed from `(bucket, key)` plus the current node map; there is no central per-object placement table.
+- Gateway metadata and node state are replicated with embedded Raft, so any gateway can accept reads and followers transparently forward writes to the current leader.
 - Rebalancing is done in the background by comparing the current replica set against the desired replica set.
 
 ## Important gaps
@@ -118,9 +173,6 @@ This is intentionally a prototype. It does **not** yet include:
 - erasure coding
 - TLS and mTLS between gateway and nodes
 - per-object retention / legal hold
-- distributed consensus for the metadata store
 - node-to-node copy shortcuts
 - efficient streaming fanout on upload
 - access-log compaction beyond a simple in-memory coalescer
-
-For production, I would replace the single JSON metadata file with a real replicated metadata service and split the gateway/control plane from the storage plane more aggressively.

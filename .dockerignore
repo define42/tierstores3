@@ -1,0 +1,7 @@
+.git
+main
+*.swp
+node*-nvme
+node*-hdd
+gw*-raft
+tierstore-state.json

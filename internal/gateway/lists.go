@@ -54,6 +54,10 @@ type commonPrefix struct {
 }
 
 func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.Barrier(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	st := s.store.Snapshot()
 	names := model.SortedBucketNames(st.Buckets)
 	result := listAllMyBucketsResult{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/"}
@@ -65,6 +69,10 @@ func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListObjects(w http.ResponseWriter, r *http.Request, bucket string) {
+	if err := s.store.Barrier(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	if !s.store.BucketExists(bucket) {
 		http.Error(w, "bucket not found", http.StatusNotFound)
 		return

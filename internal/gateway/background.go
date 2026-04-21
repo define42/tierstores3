@@ -17,25 +17,70 @@ import (
 func (s *Server) runAccessTracker(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.AccessFlushInterval)
 	defer ticker.Stop()
-	pending := make(map[string]accessEvent)
-	flush := func() {
-		for k, ev := range pending {
-			_ = s.store.MarkAccess(ev.bucket, ev.key, ev.at)
+	pending := make(map[string]model.AccessEvent)
+	flush := func(flushCtx context.Context) {
+		if len(pending) == 0 {
+			return
+		}
+		events := make([]model.AccessEvent, 0, len(pending))
+		for _, ev := range pending {
+			events = append(events, ev)
+		}
+		if err := s.store.MarkAccessBatch(flushCtx, events); err != nil {
+			return
+		}
+		for k := range pending {
 			delete(pending, k)
 		}
 	}
 	for {
 		select {
 		case <-ctx.Done():
-			flush()
+			flush(ctx)
 			return
 		case ev := <-s.accessCh:
-			k := model.ObjectMapKey(ev.bucket, ev.key)
-			if current, ok := pending[k]; !ok || ev.at.After(current.at) {
+			k := model.ObjectMapKey(ev.Bucket, ev.Key)
+			if current, ok := pending[k]; !ok || ev.At.After(current.At) {
 				pending[k] = ev
 			}
 		case <-ticker.C:
-			flush()
+			flush(ctx)
+		}
+	}
+}
+
+func (s *Server) runLeaderLoops(ctx context.Context) {
+	var cancel context.CancelFunc
+	start := func() {
+		if cancel != nil {
+			return
+		}
+		leaderCtx, leaderCancel := context.WithCancel(ctx)
+		cancel = leaderCancel
+		go s.runTieringLoop(leaderCtx)
+		go s.runRebalanceLoop(leaderCtx)
+	}
+	stop := func() {
+		if cancel == nil {
+			return
+		}
+		cancel()
+		cancel = nil
+	}
+	if s.store.IsLeader() {
+		start()
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			stop()
+			return
+		case isLeader := <-s.store.LeaderCh():
+			if isLeader {
+				start()
+			} else {
+				stop()
+			}
 		}
 	}
 }
@@ -109,26 +154,26 @@ func (s *Server) demoteObject(ctx context.Context, bucket, key string) error {
 	if err := s.uploadReplicas(ctx, tmp.path, tmp.size, obj.SHA256, obj.ObjectID, targetReplicas); err != nil {
 		return err
 	}
-	_, err = s.store.UpdateObject(bucket, key, func(o *model.Object) error {
-		if o.ObjectID != obj.ObjectID {
-			return fmt.Errorf("object changed during demotion")
-		}
-		o.WarmReplicas = targetReplicas
-		o.CurrentTier = model.TierWarm
-		o.UpdatedAt = time.Now().UTC()
-		return nil
+	_, err = s.store.PatchObject(ctx, &meta.ObjectPatch{
+		Bucket:              bucket,
+		Key:                 key,
+		ExpectedObjectID:    obj.ObjectID,
+		HasCurrentTier:      true,
+		CurrentTier:         model.TierWarm,
+		ReplaceWarmReplicas: true,
+		WarmReplicas:        targetReplicas,
 	})
 	if err != nil {
 		return err
 	}
 	s.bestEffortDeleteReplicas(ctx, obj.HotReplicas, obj.ObjectID)
-	_, _ = s.store.UpdateObject(bucket, key, func(o *model.Object) error {
-		if o.ObjectID != obj.ObjectID || o.CurrentTier != model.TierWarm {
-			return nil
-		}
-		o.HotReplicas = nil
-		o.UpdatedAt = time.Now().UTC()
-		return nil
+	_, _ = s.store.PatchObject(ctx, &meta.ObjectPatch{
+		Bucket:              bucket,
+		Key:                 key,
+		ExpectedObjectID:    obj.ObjectID,
+		OnlyIfCurrentTier:   true,
+		RequiredCurrentTier: model.TierWarm,
+		ReplaceHotReplicas:  true,
 	})
 	return nil
 }
@@ -158,27 +203,29 @@ func (s *Server) promoteObject(ctx context.Context, bucket, key string) error {
 	if err := s.uploadReplicas(ctx, tmp.path, tmp.size, obj.SHA256, obj.ObjectID, targetReplicas); err != nil {
 		return err
 	}
-	_, err = s.store.UpdateObject(bucket, key, func(o *model.Object) error {
-		if o.ObjectID != obj.ObjectID {
-			return fmt.Errorf("object changed during promotion")
-		}
-		o.HotReplicas = targetReplicas
-		o.CurrentTier = model.TierHot
-		o.UpdatedAt = time.Now().UTC()
-		o.LastAccessedAt = time.Now().UTC()
-		return nil
+	accessedAt := time.Now().UTC()
+	_, err = s.store.PatchObject(ctx, &meta.ObjectPatch{
+		Bucket:             bucket,
+		Key:                key,
+		ExpectedObjectID:   obj.ObjectID,
+		HasCurrentTier:     true,
+		CurrentTier:        model.TierHot,
+		ReplaceHotReplicas: true,
+		HotReplicas:        targetReplicas,
+		HasLastAccessedAt:  true,
+		LastAccessedAt:     accessedAt,
 	})
 	if err != nil {
 		return err
 	}
 	s.bestEffortDeleteReplicas(ctx, obj.WarmReplicas, obj.ObjectID)
-	_, _ = s.store.UpdateObject(bucket, key, func(o *model.Object) error {
-		if o.ObjectID != obj.ObjectID || o.CurrentTier != model.TierHot {
-			return nil
-		}
-		o.WarmReplicas = nil
-		o.UpdatedAt = time.Now().UTC()
-		return nil
+	_, _ = s.store.PatchObject(ctx, &meta.ObjectPatch{
+		Bucket:              bucket,
+		Key:                 key,
+		ExpectedObjectID:    obj.ObjectID,
+		OnlyIfCurrentTier:   true,
+		RequiredCurrentTier: model.TierHot,
+		ReplaceWarmReplicas: true,
 	})
 	return nil
 }
@@ -217,14 +264,7 @@ func (s *Server) ensurePlacement(ctx context.Context, bucket, key string) error 
 		}
 	}
 
-	_, err = s.store.UpdateObject(bucket, key, func(o *model.Object) error {
-		if o.ObjectID != obj.ObjectID {
-			return fmt.Errorf("object changed during rebalance")
-		}
-		o.SetReplicasForTier(o.CurrentTier, desiredReplicas)
-		o.UpdatedAt = time.Now().UTC()
-		return nil
-	})
+	_, err = s.store.PatchObject(ctx, replicasPatch(bucket, key, obj.ObjectID, obj.CurrentTier, desiredReplicas))
 	if err != nil {
 		return err
 	}
@@ -257,14 +297,7 @@ func (s *Server) cleanupStaleTier(ctx context.Context, obj *model.Object) error 
 	for _, rep := range stale {
 		_ = s.client.DeleteObject(ctx, rep.URL, staleTier, fresh.ObjectID)
 	}
-	_, _ = s.store.UpdateObject(fresh.Bucket, fresh.Key, func(o *model.Object) error {
-		if o.ObjectID != fresh.ObjectID {
-			return nil
-		}
-		o.SetReplicasForTier(staleTier, nil)
-		o.UpdatedAt = time.Now().UTC()
-		return nil
-	})
+	_, _ = s.store.PatchObject(ctx, replicasPatch(fresh.Bucket, fresh.Key, fresh.ObjectID, staleTier, nil))
 	return nil
 }
 
@@ -376,4 +409,30 @@ func normalizedReplicaKeys(in []model.Replica) []string {
 
 func repKey(rep model.Replica) string {
 	return fmt.Sprintf("%s|%s|%s", rep.NodeID, rep.URL, rep.Tier)
+}
+
+func replicasPatch(bucket, key, objectID string, tier model.Tier, replicas []model.Replica) *meta.ObjectPatch {
+	patch := &meta.ObjectPatch{
+		Bucket:           bucket,
+		Key:              key,
+		ExpectedObjectID: objectID,
+	}
+	switch tier {
+	case model.TierHot:
+		patch.ReplaceHotReplicas = true
+		patch.HotReplicas = cloneReplicaSet(replicas)
+	case model.TierWarm:
+		patch.ReplaceWarmReplicas = true
+		patch.WarmReplicas = cloneReplicaSet(replicas)
+	}
+	return patch
+}
+
+func cloneReplicaSet(in []model.Replica) []model.Replica {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]model.Replica, len(in))
+	copy(out, in)
+	return out
 }

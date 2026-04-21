@@ -11,7 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,7 +30,12 @@ import (
 )
 
 type Config struct {
-	StatePath           string
+	GatewayID           string
+	AdvertiseURL        string
+	RaftAddr            string
+	RaftDir             string
+	Bootstrap           bool
+	ControllerPeers     []meta.Peer
 	PlacementGroups     uint64
 	ReplicationFactor   int
 	ColdAfter           time.Duration
@@ -44,14 +52,8 @@ type Server struct {
 	selector *placement.Selector
 	client   *storageclient.Client
 	locks    *lockset.Set
-	accessCh chan accessEvent
+	accessCh chan model.AccessEvent
 	tmpDir   string
-}
-
-type accessEvent struct {
-	bucket string
-	key    string
-	at     time.Time
 }
 
 func New(cfg Config) (*Server, error) {
@@ -76,7 +78,17 @@ func New(cfg Config) (*Server, error) {
 	if cfg.NodeHTTPTimeout == 0 {
 		cfg.NodeHTTPTimeout = 2 * time.Minute
 	}
-	store, err := meta.NewStore(cfg.StatePath, cfg.PlacementGroups, cfg.ReplicationFactor)
+	store, err := meta.NewStore(meta.Config{
+		GatewayID:         cfg.GatewayID,
+		AdvertiseURL:      cfg.AdvertiseURL,
+		RaftAddr:          cfg.RaftAddr,
+		RaftDir:           cfg.RaftDir,
+		Bootstrap:         cfg.Bootstrap,
+		Peers:             cfg.ControllerPeers,
+		PlacementGroups:   cfg.PlacementGroups,
+		ReplicationFactor: cfg.ReplicationFactor,
+		ReadTimeout:       5 * time.Second,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -86,13 +98,15 @@ func New(cfg Config) (*Server, error) {
 		selector: placement.NewSelector(),
 		client:   storageclient.New(cfg.NodeHTTPTimeout),
 		locks:    lockset.New(),
-		accessCh: make(chan accessEvent, 4096),
+		accessCh: make(chan model.AccessEvent, 4096),
 		tmpDir:   os.TempDir(),
 	}, nil
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/_internal/control/read-index", s.handleInternalReadIndex)
+	mux.HandleFunc("/_internal/control/access-batch", s.handleInternalAccessBatch)
 	mux.HandleFunc("/_admin/cluster", s.handleAdminCluster)
 	mux.HandleFunc("/_admin/nodes", s.handleAdminNodes)
 	mux.HandleFunc("/_admin/nodes/", s.handleAdminNodeAction)
@@ -102,8 +116,11 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) RunBackground(ctx context.Context) {
 	go s.runAccessTracker(ctx)
-	go s.runTieringLoop(ctx)
-	go s.runRebalanceLoop(ctx)
+	go s.runLeaderLoops(ctx)
+}
+
+func (s *Server) Close() error {
+	return s.store.Close()
 }
 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
@@ -123,7 +140,10 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, bucket string) {
-	if err := s.store.EnsureBucket(bucket); err != nil {
+	if s.forwardToLeader(w, r) {
+		return
+	}
+	if err := s.store.EnsureBucket(r.Context(), bucket); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -146,7 +166,13 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, ke
 }
 
 func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if err := s.store.EnsureBucket(bucket); err != nil {
+	if s.forwardToLeader(w, r) {
+		return
+	}
+	unlock := s.locks.Lock(model.ObjectMapKey(bucket, key))
+	defer unlock()
+
+	if err := s.store.EnsureBucket(r.Context(), bucket); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -187,7 +213,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		LastAccessedAt: now,
 	}
 	old, _ := s.store.GetObject(bucket, key)
-	if err := s.store.PutObject(obj); err != nil {
+	if _, err := s.store.PutObject(r.Context(), obj); err != nil {
 		s.bestEffortDeleteReplicas(context.Background(), replicas, objectID)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -201,6 +227,10 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 }
 
 func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	if err := s.store.Barrier(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	obj, err := s.store.GetObject(bucket, key)
 	if err != nil {
 		status := http.StatusNotFound
@@ -237,6 +267,10 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 }
 
 func (s *Server) handleHeadObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	if err := s.store.Barrier(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	obj, err := s.store.GetObject(bucket, key)
 	if err != nil {
 		status := http.StatusNotFound
@@ -264,7 +298,13 @@ func (s *Server) handleHeadObject(w http.ResponseWriter, r *http.Request, bucket
 }
 
 func (s *Server) handleDeleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	obj, err := s.store.DeleteObject(bucket, key)
+	if s.forwardToLeader(w, r) {
+		return
+	}
+	unlock := s.locks.Lock(model.ObjectMapKey(bucket, key))
+	defer unlock()
+
+	obj, err := s.store.DeleteObject(r.Context(), bucket, key)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			w.WriteHeader(http.StatusNoContent)
@@ -282,12 +322,19 @@ func (s *Server) handleAdminCluster(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if err := s.store.Barrier(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	writeJSON(w, http.StatusOK, s.store.Snapshot())
 }
 
 func (s *Server) handleAdminNodes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.forwardToLeader(w, r) {
 		return
 	}
 	var in struct {
@@ -305,12 +352,17 @@ func (s *Server) handleAdminNodes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "id and url are required", http.StatusBadRequest)
 		return
 	}
+	if _, err := url.Parse(in.URL); err != nil {
+		http.Error(w, fmt.Sprintf("invalid node url: %v", err), http.StatusBadRequest)
+		return
+	}
 	node := &model.Node{ID: in.ID, URL: strings.TrimRight(in.URL, "/"), WeightHot: in.WeightHot, WeightWarm: in.WeightWarm, Zone: in.Zone, State: model.NodeStateActive}
-	if err := s.store.UpsertNode(node); err != nil {
+	stored, err := s.store.UpsertNode(r.Context(), node)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusCreated, node)
+	writeJSON(w, http.StatusCreated, stored)
 }
 
 func (s *Server) handleAdminNodeAction(w http.ResponseWriter, r *http.Request) {
@@ -322,7 +374,10 @@ func (s *Server) handleAdminNodeAction(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[0]
 	if len(parts) == 1 && r.Method == http.MethodDelete {
-		if err := s.store.RemoveNode(id); err != nil {
+		if s.forwardToLeader(w, r) {
+			return
+		}
+		if err := s.store.RemoveNode(r.Context(), id); err != nil {
 			status := http.StatusInternalServerError
 			if errors.Is(err, meta.ErrNotFound) {
 				status = http.StatusNotFound
@@ -347,10 +402,57 @@ func (s *Server) handleAdminNodeAction(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if err := s.store.SetNodeState(id, state); err != nil {
+	if s.forwardToLeader(w, r) {
+		return
+	}
+	if err := s.store.SetNodeState(r.Context(), id, state); err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, meta.ErrNotFound) {
 			status = http.StatusNotFound
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleInternalReadIndex(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	index, err := s.store.ReadIndex(r.Context())
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, meta.ErrNotLeader) {
+			status = http.StatusConflict
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"applied_index": index})
+}
+
+func (s *Server) handleInternalAccessBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.store.IsLeader() {
+		http.Error(w, meta.ErrNotLeader.Error(), http.StatusConflict)
+		return
+	}
+	var in struct {
+		Events []model.AccessEvent `json:"events"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, fmt.Sprintf("decode json: %v", err), http.StatusBadRequest)
+		return
+	}
+	if err := s.store.MarkAccessBatch(r.Context(), in.Events); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, meta.ErrNotLeader) {
+			status = http.StatusConflict
 		}
 		http.Error(w, err.Error(), status)
 		return
@@ -407,15 +509,45 @@ func (s *Server) bestEffortDeleteRecordCopies(ctx context.Context, obj *model.Ob
 
 func (s *Server) recordAccess(bucket, key string) {
 	select {
-	case s.accessCh <- accessEvent{bucket: bucket, key: key, at: time.Now().UTC()}:
+	case s.accessCh <- model.AccessEvent{Bucket: bucket, Key: key, At: time.Now().UTC()}:
 	default:
 		go func() {
 			select {
-			case s.accessCh <- accessEvent{bucket: bucket, key: key, at: time.Now().UTC()}:
+			case s.accessCh <- model.AccessEvent{Bucket: bucket, Key: key, At: time.Now().UTC()}:
 			case <-time.After(250 * time.Millisecond):
 			}
 		}()
 	}
+}
+
+func (s *Server) forwardToLeader(w http.ResponseWriter, r *http.Request) bool {
+	if s.store.IsLeader() {
+		return false
+	}
+	leader, err := s.store.LeaderPeer()
+	if err != nil || leader.APIURL == "" {
+		http.Error(w, "leader unavailable", http.StatusServiceUnavailable)
+		return true
+	}
+	target, err := url.Parse(leader.APIURL)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid leader url: %v", err), http.StatusServiceUnavailable)
+		return true
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, proxyErr error) {
+		http.Error(rw, proxyErr.Error(), http.StatusBadGateway)
+	}
+	original := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		original(req)
+		req.Host = target.Host
+		if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+			req.Header.Set("X-Forwarded-For", clientIP)
+		}
+	}
+	proxy.ServeHTTP(w, r)
+	return true
 }
 
 type spooledBody struct {

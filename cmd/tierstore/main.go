@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"tierstore/internal/gateway"
+	"tierstore/internal/meta"
 	"tierstore/internal/node"
 )
 
@@ -67,7 +70,12 @@ func runGateway(args []string) {
 	fs := flag.NewFlagSet("gateway", flag.ExitOnError)
 	var (
 		listen          = fs.String("listen", ":9000", "listen address")
-		statePath       = fs.String("state", "./tierstore-state.json", "metadata state file")
+		gatewayID       = fs.String("gateway-id", "", "gateway/controller node ID")
+		advertiseURL    = fs.String("advertise-url", "", "gateway API URL advertised to peer gateways")
+		raftAddr        = fs.String("raft-addr", "", "raft bind address for this gateway")
+		raftDir         = fs.String("raft-dir", "./raft", "raft state directory")
+		join            = fs.String("join", "", "comma-separated peer list: id=http://api:port@raft-host:port")
+		bootstrap       = fs.Bool("bootstrap", false, "bootstrap the controller cluster and add configured peers")
 		placementGroups = fs.Uint64("placement-groups", 1024, "number of placement groups")
 		replicas        = fs.Int("replicas", 3, "replication factor")
 		coldAfter       = fs.Duration("cold-after", 30*24*time.Hour, "move objects to warm tier after this idle period")
@@ -76,9 +84,27 @@ func runGateway(args []string) {
 		rebalanceInt    = fs.Duration("rebalance-interval", 2*time.Minute, "rebalance scan interval")
 	)
 	fs.Parse(args)
+	if *gatewayID == "" {
+		log.Fatal("-gateway-id is required")
+	}
+	if *raftAddr == "" {
+		log.Fatal("-raft-addr is required")
+	}
+	if *advertiseURL == "" {
+		*advertiseURL = defaultAdvertiseURL(*listen)
+	}
+	peers, err := parsePeers(*join)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	srv, err := gateway.New(gateway.Config{
-		StatePath:         *statePath,
+		GatewayID:         *gatewayID,
+		AdvertiseURL:      *advertiseURL,
+		RaftAddr:          *raftAddr,
+		RaftDir:           *raftDir,
+		Bootstrap:         *bootstrap,
+		ControllerPeers:   peers,
 		PlacementGroups:   *placementGroups,
 		ReplicationFactor: *replicas,
 		ColdAfter:         *coldAfter,
@@ -89,6 +115,11 @@ func runGateway(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer func() {
+		if err := srv.Close(); err != nil {
+			log.Printf("close gateway store: %v", err)
+		}
+	}()
 	ctx := signalContext()
 	srv.RunBackground(ctx)
 	httpSrv := &http.Server{Addr: *listen, Handler: srv.Handler()}
@@ -98,7 +129,7 @@ func runGateway(args []string) {
 		defer cancel()
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
-	log.Printf("gateway listening on %s state=%s", *listen, *statePath)
+	log.Printf("gateway %s listening on %s api=%s raft=%s dir=%s", *gatewayID, *listen, *advertiseURL, *raftAddr, *raftDir)
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
@@ -114,5 +145,44 @@ func usage() {
 
 Usage:
   tierstore node    -id node1 -listen :9101 -hot-dir /nvme -warm-dir /hdd
-  tierstore gateway -listen :9000 -state ./tierstore-state.json`)
+  tierstore gateway -gateway-id gw1 -listen :9000 -advertise-url http://127.0.0.1:9000 -raft-addr 127.0.0.1:10001 -raft-dir ./gw1-raft`)
+}
+
+func parsePeers(raw string) ([]meta.Peer, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	peers := make([]meta.Peer, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, rest, ok := strings.Cut(part, "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid peer %q: want id=http://api:port@raft-host:port", part)
+		}
+		apiURL, raftAddr, ok := strings.Cut(rest, "@")
+		if !ok {
+			return nil, fmt.Errorf("invalid peer %q: want id=http://api:port@raft-host:port", part)
+		}
+		if _, err := url.Parse(apiURL); err != nil {
+			return nil, fmt.Errorf("invalid peer api url %q: %w", apiURL, err)
+		}
+		peers = append(peers, meta.Peer{
+			ID:       strings.TrimSpace(id),
+			APIURL:   strings.TrimRight(strings.TrimSpace(apiURL), "/"),
+			RaftAddr: strings.TrimSpace(raftAddr),
+		})
+	}
+	return peers, nil
+}
+
+func defaultAdvertiseURL(listen string) string {
+	hostPort := listen
+	if strings.HasPrefix(hostPort, ":") {
+		hostPort = "127.0.0.1" + hostPort
+	}
+	return "http://" + hostPort
 }

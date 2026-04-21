@@ -31,7 +31,11 @@ func (c *Client) UploadFile(ctx context.Context, nodeURL string, tier model.Tier
 	}
 	defer f.Close()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, internalObjectURL(nodeURL, tier, objectID), f)
+	target, err := internalObjectURL(nodeURL, tier, objectID)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, f)
 	if err != nil {
 		return fmt.Errorf("create upload request: %w", err)
 	}
@@ -53,7 +57,11 @@ func (c *Client) UploadFile(ctx context.Context, nodeURL string, tier model.Tier
 }
 
 func (c *Client) GetObject(ctx context.Context, nodeURL string, tier model.Tier, objectID string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, internalObjectURL(nodeURL, tier, objectID), nil)
+	target, err := internalObjectURL(nodeURL, tier, objectID)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create get request: %w", err)
 	}
@@ -70,7 +78,11 @@ func (c *Client) GetObject(ctx context.Context, nodeURL string, tier model.Tier,
 }
 
 func (c *Client) HeadObject(ctx context.Context, nodeURL string, tier model.Tier, objectID string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, internalObjectURL(nodeURL, tier, objectID), nil)
+	target, err := internalObjectURL(nodeURL, tier, objectID)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, target, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create head request: %w", err)
 	}
@@ -87,7 +99,11 @@ func (c *Client) HeadObject(ctx context.Context, nodeURL string, tier model.Tier
 }
 
 func (c *Client) DeleteObject(ctx context.Context, nodeURL string, tier model.Tier, objectID string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, internalObjectURL(nodeURL, tier, objectID), nil)
+	target, err := internalObjectURL(nodeURL, tier, objectID)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, target, nil)
 	if err != nil {
 		return fmt.Errorf("create delete request: %w", err)
 	}
@@ -106,11 +122,11 @@ func (c *Client) DeleteObject(ctx context.Context, nodeURL string, tier model.Ti
 	return nil
 }
 
-func internalObjectURL(nodeURL string, tier model.Tier, objectID string) string {
+func internalObjectURL(nodeURL string, tier model.Tier, objectID string) (string, error) {
 	u, err := url.Parse(nodeURL)
 	if err != nil {
-		panic(err)
+		return "", fmt.Errorf("parse node url %q: %w", nodeURL, err)
 	}
 	u.Path = path.Join(u.Path, "/_internal/tiers", string(tier), "objects", objectID)
-	return u.String()
+	return u.String(), nil
 }

@@ -39,6 +39,12 @@ type Replica struct {
 	AddedAt time.Time `json:"added_at"`
 }
 
+type AccessEvent struct {
+	Bucket string    `json:"bucket"`
+	Key    string    `json:"key"`
+	At     time.Time `json:"at"`
+}
+
 type Bucket struct {
 	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"created_at"`
